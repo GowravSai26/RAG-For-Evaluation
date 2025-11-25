@@ -1,0 +1,8 @@
+openai
+anthropic
+perplexity
+dotenv
+langchain
+pandas
+numpy
+requests
