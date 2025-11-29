@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
 """
 ESG Survey Scoring Script
 
-- Detects question groups dynamically (Question_2, Question_4_1, Question_5.1_3, etc.)
-- Generates AI insights using OpenAI
+- Detects question groups dynamically
+- Generates AI insights using:
+    - GPT-4.1-mini
+    - GPT-5.1       
 - Computes similarity against LGBT feedback
-- Writes output columns next to the related question block
 """
 
 from __future__ import annotations
@@ -17,6 +17,9 @@ import time
 from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
+import warnings
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+
 from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from tqdm import tqdm
@@ -28,15 +31,22 @@ load_dotenv(find_dotenv(usecwd=True))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 DEFAULT_MODEL = "gpt-4.1-mini"
+GPT5_MODEL = "gpt-5.1"
 
 AI_INSIGHT_SYSTEM_PROMPT = "Check chat"
+
+GPT5_INSIGHT_SYSTEM_PROMPT = """
+You are an ESG analysis model. Provide a clear, structured, detailed summarization
+of LGBTQ+ DE&I responsibilities based on the employee response. Output must be a
+well-formatted explanation.
+""".strip()
 
 SCORING_SYSTEM_PROMPT = """
 Act as an ESG reviewer. Your task is to review insights given by AI against the provided LGBT Feedback.
 If the insight contains the same analysis as the LGBT Feedback, give a score of 100%.
 If partial, give a score based on semantic match.
 If no match, give 0%.
-Return ONLY the percentage number (e.g., "85%").
+Return ONLY the percentage number.
 """.strip()
 
 SCORING_USER_TEMPLATE = """
@@ -67,7 +77,11 @@ def detect_question_bases(columns: List[str]) -> List[str]:
 
     for c in columns:
         if c.startswith("Question_") and not any(
-            c.endswith(s) for s in ("_Response", "_LGBT_Feedback", "_OpenAI_Response", "_Similarity_in_Insights")
+            c.endswith(s) for s in (
+                "_Response", "_LGBT_Feedback",
+                "_OpenAI_Response", "_Similarity_in_Insights",
+                "_GPT5_Response", "_Similarity_in_Insights_5"
+            )
         ):
             if pattern.match(c) and has_response(c):
                 bases.append(c)
@@ -90,12 +104,14 @@ def insert_after(df: pd.DataFrame, after_col: str, new_cols: List[str]) -> None:
             pos += 1
 
 
-def ensure_output_cols(df: pd.DataFrame, base: str) -> Tuple[str, str]:
-    ai_col = f"{base}_OpenAI_Response"
-    sim_col = f"{base}_Similarity_in_Insights"
+def ensure_output_cols(df: pd.DataFrame, base: str):
+    ai4 = f"{base}_OpenAI_Response"
+    sim4 = f"{base}_Similarity_in_Insights"
+    ai5 = f"{base}_GPT5_Response"
+    sim5 = f"{base}_Similarity_in_Insights_5"
 
-    if ai_col in df.columns and sim_col in df.columns:
-        return ai_col, sim_col
+    if ai4 in df.columns and sim4 in df.columns and ai5 in df.columns and sim5 in df.columns:
+        return ai4, sim4, ai5, sim5
 
     fb = f"{base}_LGBT_Feedback"
     resp = f"{base}_Response"
@@ -104,23 +120,38 @@ def ensure_output_cols(df: pd.DataFrame, base: str) -> Tuple[str, str]:
     if insert_after_col is None:
         insert_after_col = df.columns[-1]
 
-    insert_after(df, insert_after_col, [ai_col, sim_col])
-    return ai_col, sim_col
+    insert_after(df, insert_after_col, [ai4, sim4, ai5, sim5])
+    return ai4, sim4, ai5, sim5
 
 
 # -------------------------
 # OpenAI Utilities
 # -------------------------
-def call_openai(client, messages, max_tokens=300) -> str:
+def call_openai(client, messages, max_tokens=300, model_override=None) -> str:
+    model = model_override or DEFAULT_MODEL
     try:
         response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
+            model=model,
             messages=messages,
             max_completion_tokens=max_tokens,
         )
         return response.choices[0].message.content or ""
     except Exception:
         return ""
+
+
+def call_gpt5_with_retry(client, messages, retries=2):
+    for _ in range(retries):
+        out = call_openai(
+            client,
+            messages,
+            max_tokens=1000,            # GPT-5 needs more space
+            model_override=GPT5_MODEL
+        )
+        if out.strip():
+            return out
+        time.sleep(0.5)
+    return ""
 
 
 def extract_percent(text: Optional[str]) -> str:
@@ -142,16 +173,15 @@ def extract_percent(text: Optional[str]) -> str:
 # Main Processing
 # -------------------------
 def process_csv(input_path: str, output_path: str, dry_run=False, delay=0.2, log_path="data/esg_scoring_log.csv"):
-    df = pd.read_csv(input_path, dtype=str).fillna("")
 
+    df = pd.read_csv(input_path, dtype=str).fillna("")
     bases = detect_question_bases(df.columns.tolist())
     client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
     log: List[Dict[str, str]] = []
 
     for row in tqdm(range(len(df)), desc="Processing"):
         for base in bases:
-            ai_col, sim_col = ensure_output_cols(df, base)
+            ai4_col, sim4_col, ai5_col, sim5_col = ensure_output_cols(df, base)
 
             resp_col = f"{base}_Response"
             fb_col = f"{base}_LGBT_Feedback"
@@ -160,60 +190,65 @@ def process_csv(input_path: str, output_path: str, dry_run=False, delay=0.2, log
             r = df.at[row, resp_col].strip() if resp_col in df.columns else ""
             fb = df.at[row, fb_col].strip() if fb_col in df.columns else ""
 
-            entry = {"row": row, "base": base, "ai": "no", "sim": "no", "error": ""}
+            entry = {"row": row, "base": base}
 
             if not r:
-                df.at[row, ai_col] = ""
-                df.at[row, sim_col] = "N/A"
-                log.append(entry)
-                continue
-
-            if df.at[row, ai_col].strip() and df.at[row, sim_col].strip() not in ("", "N/A"):
-                entry["ai"] = entry["sim"] = "yes"
+                df.at[row, ai4_col] = ""
+                df.at[row, sim4_col] = "N/A"
+                df.at[row, ai5_col] = ""
+                df.at[row, sim5_col] = "N/A"
                 log.append(entry)
                 continue
 
             if dry_run or client is None:
-                ai_out = f"[DRY RUN] {base}"
-                sim_out = "N/A"
-            else:
-                ai_out = call_openai(client, [
-                    {"role": "system", "content": AI_INSIGHT_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Question: {q}\n\nResponse: {r}"}
-                ])
+                df.at[row, ai4_col] = f"[DRY RUN]"
+                df.at[row, sim4_col] = "N/A"
+                df.at[row, ai5_col] = f"[DRY RUN GPT5]"
+                df.at[row, sim5_col] = "N/A"
+                continue
 
-                score_raw = call_openai(client, [
-                    {"role": "system", "content": SCORING_SYSTEM_PROMPT},
-                    {"role": "user", "content": SCORING_USER_TEMPLATE.format(
-                        question=q, response=r, ai=ai_out, feedback=fb
-                    )}
-                ], max_tokens=60)
+            # ---------------- GPT-4 INSIGHT ----------------
+            ai4_out = call_openai(client, [
+                {"role": "system", "content": AI_INSIGHT_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Question: {q}\n\nResponse: {r}"}
+            ])
 
-                sim_out = extract_percent(score_raw)
+            score4_raw = call_openai(client, [
+                {"role": "system", "content": SCORING_SYSTEM_PROMPT},
+                {"role": "user", "content": SCORING_USER_TEMPLATE.format(
+                    question=q, response=r, ai=ai4_out, feedback=fb
+                )}
+            ], max_tokens=60)
 
-            df.at[row, ai_col] = ai_out.strip()
-            df.at[row, sim_col] = sim_out
+            sim4 = extract_percent(score4_raw)
 
-            entry["ai"] = "yes"
-            entry["sim"] = "yes"
-            log.append(entry)
+            # ---------------- GPT-5 INSIGHT (FIXED) ----------------
+            ai5_out = call_gpt5_with_retry(client, [
+                {"role": "system", "content": GPT5_INSIGHT_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Question: {q}\n\nResponse: {r}"}
+            ])
+
+            score5_raw = call_gpt5_with_retry(client, [
+                {"role": "system", "content": SCORING_SYSTEM_PROMPT},
+                {"role": "user", "content": SCORING_USER_TEMPLATE.format(
+                    question=q, response=r, ai=ai5_out, feedback=fb
+                )}
+            ])
+
+            sim5 = extract_percent(score5_raw)
+
+            df.at[row, ai4_col] = ai4_out
+            df.at[row, sim4_col] = sim4
+            df.at[row, ai5_col] = ai5_out
+            df.at[row, sim5_col] = sim5
 
             if delay:
                 time.sleep(delay)
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     df.to_csv(output_path, index=False)
 
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    with open(log_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["row", "base", "ai", "sim", "error"])
-        writer.writeheader()
-        writer.writerows(log)
 
 
-# -------------------------
-# Entry
-# -------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
